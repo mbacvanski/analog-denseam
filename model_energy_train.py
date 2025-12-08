@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 import optax
+import numpy as np
 
 
 # ------------------------------------------------------------
@@ -393,7 +394,6 @@ def generate_and_save_datasets(key, ctx_length=8, train_ratio=0.8, filename_pref
     test_y = labels[int(n * train_ratio):]
 
     # Save to disk as txt
-    import numpy as np
     np.savetxt(f"{filename_prefix}_train_X.txt", train_X, fmt='%d')
     np.savetxt(f"{filename_prefix}_train_y.txt", train_y, fmt='%d')
     np.savetxt(f"{filename_prefix}_test_X.txt", test_X, fmt='%d')
@@ -401,7 +401,6 @@ def generate_and_save_datasets(key, ctx_length=8, train_ratio=0.8, filename_pref
 
 
 def load_dataset(filename_prefix="parity_data"):
-    import numpy as np
     train_X = jnp.array(np.loadtxt(f"{filename_prefix}_train_X.txt", dtype=np.int32))
     train_y = jnp.array(np.loadtxt(f"{filename_prefix}_train_y.txt", dtype=np.int32))
     test_X = jnp.array(np.loadtxt(f"{filename_prefix}_test_X.txt", dtype=np.int32))
@@ -490,14 +489,17 @@ if __name__ == "__main__":
     num_train = train_X.shape[0]
     num_batches = (num_train + Cfg.batch_size - 1) // Cfg.batch_size
 
+    losses_all = []
+    losses_steps = []
+    accs_all = []
+    accs_steps = []
     for epoch in range(Cfg.train_epochs):
         t_start = time.time()
         key, key_perm = jr.split(key)
         index_perm = jr.permutation(key_perm, num_train)
         train_X_epoch = train_X[index_perm]
         train_y_epoch = train_y[index_perm]
-        losses = []
-        accs = []
+        losses_epoch = []
 
         # compute current force penalty weight (cosine ramp 0 -> 1)
         lam_force = jnp.asarray(force_penalty_weight(epoch), dtype=jnp.float32)
@@ -512,16 +514,20 @@ if __name__ == "__main__":
             params, opt_state, loss = train_step(
                 params, opt_state, batch_train_X, batch_train_y, key=sub, force_weight=lam_force
             )
-            losses.append(loss)
+            losses_epoch.append(loss)
+            losses_all.append(float(loss))
+            losses_steps.append(epoch * num_batches + batch)
 
         t_end = time.time()
 
         if epoch % 100 == 0:
             acc = evaluate(params, valid_X, valid_y)
-            accs.append(acc)
+            # accs.append(acc)
+            accs_all.append(float(acc))
+            accs_steps.append((epoch + 1) * num_batches - 1)
             print(f"epoch {epoch:5d} | "
                   f"force_w {float(lam_force):5.3f} | "
-                  f"train loss {jnp.mean(jnp.array(losses)):8.4f} | "
+                  f"train loss {jnp.mean(jnp.array(losses_epoch)):8.4f} | "
                   f"valid acc {acc:6.4f} | "
                   f"{(t_end - t_start):3.3f}s / epoch | "
                   )
@@ -531,6 +537,11 @@ if __name__ == "__main__":
             if acc >= 0.99:
                 with open("model_best.pkl", "wb") as f:
                     pickle.dump(params, f)
+
+    with open("losses.pkl", "wb") as f:
+        pickle.dump((losses_steps, losses_all), f)
+    with open("accs.pkl", "wb") as f:
+        pickle.dump((accs_steps, accs_all), f)
 
     with open("model.pkl", "wb") as f:
         pickle.dump(params, f)
