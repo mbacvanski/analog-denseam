@@ -41,7 +41,7 @@ if __name__ == "__main__":
             end_value=peak * end_factor,
         )
 
-    # don't apply weight decay to W_enc and W_hopf
+    # don't apply weight decay to xi_attn_emb and xi_hopf
     tx_fast = optax.chain(
         optax.clip_by_global_norm(Config.max_norm),
         optax.adamw(

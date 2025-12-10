@@ -2,10 +2,10 @@ class Config:
     D: int = 16
     L: int = 8
     M: int = 16
-    beta: float = 0.1
 
-    W_enc_scale: float = 0.1
-    W_hopf_scale: float = 0.06
+    beta: float = 0.1
+    xi_attn_emb_scale: float = 0.1
+    xi_hopf_scale: float = 0.06
 
     # --- Stable integration parameters ---
     step_size: float = 1e-3
