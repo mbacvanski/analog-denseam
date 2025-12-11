@@ -5,9 +5,8 @@ used during training.
 """
 
 import os
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-import pickle
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 from dataclasses import dataclass
 from typing import Optional
 
@@ -17,32 +16,29 @@ import jax.numpy as jnp
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 
-import model_energy_train as md
-
-# ----------------------------
-# Config
-# ----------------------------
-PICKLE_PATH = "model_best.pkl"
-BETA = md.Cfg.beta
-ALPHA = md.Cfg.step_size / 10  # initial dt guess for the ODE solver
-T_FINAL = float(md.Cfg.T_final)
-TAU_V = md.Cfg.tau_v  # visible neuron time constant (arbitrary units)
-TAU_H = md.Cfg.tau_h  # hidden neuron time constant (faster relax)
+from config import Config
+from data import load_dataset
+from model import infer_forward_euler, logits_from_v
+from utils import load_params
 
 
-# ---------------------------------
-# Dynamics params container
-# ---------------------------------
+BETA = Config.beta
+ALPHA = Config.step_size / 10  # initial dt guess for the ODE solver
+T_FINAL = float(Config.T_final)
+TAU_V = Config.tau_v  # visible neuron time constant (arbitrary units)
+TAU_H = Config.tau_h  # hidden neuron time constant (faster relax)
+
+
 @dataclass
 class DynParams:
-    Xi: jnp.ndarray    # (L_ctx, D)
-    eta: jnp.ndarray   # (M, D)
-    a: jnp.ndarray     # (D,)
-    b_att: jnp.ndarray # (L_ctx,)
-    c: jnp.ndarray     # (M,)
-    beta: float        # scalar
-    tau_v: float       # scalar
-    tau_h: float       # scalar
+    xi_attn: jnp.ndarray  # (L, D)
+    xi_hopf: jnp.ndarray  # (M, D)
+    a: jnp.ndarray  # (D,)
+    b: jnp.ndarray  # (L,)
+    c: jnp.ndarray  # (M,)
+    beta: float  # scalar
+    tau_v: float  # scalar
+    tau_h: float  # scalar
 
 
 def make_rhs(P: DynParams):
@@ -50,61 +46,63 @@ def make_rhs(P: DynParams):
     Return a vector field fn(t, x, args_unused) -> dx/dt
     with P closed over so we don't have to pass P as `args`.
     """
-    Xi = P.Xi        # (L_ctx, D)
-    eta = P.eta      # (M, D)
-    a = P.a          # (D,)
-    b_att = P.b_att  # (L_ctx,)
-    c = P.c          # (M,)
+    xi_attn = P.xi_attn  # (L, D)
+    xi_hopf = P.xi_hopf  # (M, D)
+    a = P.a  # (D,)
+    b = P.b  # (L,)
+    c = P.c  # (M,)
     beta = P.beta
     tau_v = P.tau_v
     tau_h = P.tau_h
 
-    L_ctx = Xi.shape[0]
-    D = Xi.shape[1]
-    M = eta.shape[0]
+    L = xi_attn.shape[0]
+    D = xi_attn.shape[1]
+    M = xi_hopf.shape[0]
 
     def rhs_closure(t, x, _):
         """
-        State x = concat[v (D), h_att (L_ctx), h_hopf (M)].
+        State x = concat[v (D), h_attn (L), h_hopf (M)].
 
         Hidden:
-            pre_att  = Xi @ v + b_att
-            pre_hopf = eta @ v + c
-            dh_att   = (pre_att  - h_att)  / tau_h
+            pre_attn = xi_attn @ v + b
+            pre_hopf = xi_hopf @ v + c
+            dh_attn  = (pre_attn  - h_attn)  / tau_h
             dh_hopf  = (pre_hopf - h_hopf) / tau_h
 
         Visible:
-            p_att    = softmax(beta * h_att)
-            a_hopf   = relu(h_hopf)
-            force    = a + Xi^T p_att + eta^T a_hopf
+            f_attn   = softmax(beta * h_attn)
+            f_hopf   = relu(h_hopf)
+            force    = a + xi_attn^T f_attn + xi_hopf^T a_hopf
             dv       = (-v + force) / tau_v
         """
-        v = x[:D]                               # (D,)
-        h_att = x[D:D + L_ctx]                  # (L_ctx,)
-        h_hopf = x[D + L_ctx:D + L_ctx + M]     # (M,)
+        v = x[:D]  # (D,)
+        h_attn = x[D : D + L]  # (L,)
+        h_hopf = x[D + L : D + L + M]  # (M,)
 
         # hidden targets
-        pre_att = Xi @ v + b_att                # (L_ctx,)
-        pre_hopf = eta @ v + c                  # (M,)
+        pre_attn = xi_attn @ v + b  # (L,)
+        pre_hopf = xi_hopf @ v + c  # (M,)
 
         # relax hidden states toward their targets
-        dh_att = (pre_att - h_att) / tau_h
+        dh_attn = (pre_attn - h_attn) / tau_h
         dh_hopf = (pre_hopf - h_hopf) / tau_h
 
         # nonlinear hidden activations
-        p_att = jax.nn.softmax(beta * h_att)    # (L_ctx,)
-        a_hopf_act = jnp.maximum(h_hopf, 0.0)   # (M,)
+        f_attn = jax.nn.softmax(beta * h_attn)  # (L,)
+        f_hopf = jnp.maximum(h_hopf, 0.0)  # (M,)
 
-        # visible force
-        force = a + Xi.T @ p_att + eta.T @ a_hopf_act  # (D,)
-        dv = (-v + force) / tau_v                      # (D,)
+        # force on visible neurons
+        force = a + xi_attn.T @ f_attn + xi_hopf.T @ f_hopf  # (D,)
+        dv = (-v + force) / tau_v  # (D,)
 
-        return jnp.concatenate([dv, dh_att, dh_hopf])
+        return jnp.concatenate([dv, dh_attn, dh_hopf])
 
     return rhs_closure
 
 
-def integrate_dynamics(P: DynParams, x0: jnp.ndarray, t1: float, saveat: diffrax.SaveAt):
+def integrate_dynamics(
+    P: DynParams, x_0: jnp.ndarray, t1: float, saveat: diffrax.SaveAt
+):
     """
     Single, shared diffrax call used everywhere.
     Tsit5 + adaptive steps (PID controller).
@@ -118,7 +116,7 @@ def integrate_dynamics(P: DynParams, x0: jnp.ndarray, t1: float, saveat: diffrax
         t0=0.0,
         t1=float(t1),
         dt0=float(ALPHA),
-        y0=x0,
+        y0=x_0,
         saveat=saveat,
         # stepsize_controller=diffrax.PIDController(rtol=1e-6, atol=1e-6),
         stepsize_controller=diffrax.ConstantStepSize(),
@@ -129,35 +127,35 @@ def integrate_dynamics(P: DynParams, x0: jnp.ndarray, t1: float, saveat: diffrax
 
 def build_initial_state(
     D: int,
-    Xi: jnp.ndarray,
-    b_att: jnp.ndarray,
-    eta: jnp.ndarray,
+    xi_attn: jnp.ndarray,
+    xi_hopf: jnp.ndarray,
+    b: jnp.ndarray,
     c: jnp.ndarray,
-    v0: Optional[jnp.ndarray] = None,
+    v_0: Optional[jnp.ndarray] = None,
 ):
     """
-    Initialize x0 = [v0, h_att0, h_hopf0].
+    Initialize x_0 = [v0, h_attn_0, h_hopf_0].
     We initialize hidden states at their target preactivations.
     """
-    if v0 is None:
-        v0 = jnp.zeros((D,), dtype=jnp.float32)
+    if v_0 is None:
+        v_0 = jnp.zeros((D,), dtype=jnp.float32)
 
-    h_att0 = Xi @ v0 + b_att  # (L_ctx,)
-    h_hopf0 = eta @ v0 + c    # (M,)
+    h_attn_0 = xi_attn @ v_0 + b  # (L,)
+    h_hopf_0 = xi_hopf @ v_0 + c  # (M,)
 
-    x0 = jnp.concatenate([v0, h_att0, h_hopf0])
-    return x0
+    x_0 = jnp.concatenate([v_0, h_attn_0, h_hopf_0])
+    return x_0
 
 
 def decode_final(v_T: jnp.ndarray, W_out: jnp.ndarray, b_out: jnp.ndarray):
     """
     Same readout head as training.
-    If C==1 => binary logistic head.
+    If n_categories==1 => binary logistic head.
     Else    => multiclass argmax.
     """
-    logits = W_out @ v_T + b_out  # (C,)
-    C = logits.shape[0]
-    if C == 1:
+    logits = W_out @ v_T + b_out  # (n_categories,)
+    n_categories = logits.shape[0]
+    if n_categories == 1:
         prob = jax.nn.sigmoid(logits[0])
         pred = (prob > 0.5).astype(jnp.int32)
         return logits, prob, pred
@@ -168,51 +166,42 @@ def decode_final(v_T: jnp.ndarray, W_out: jnp.ndarray, b_out: jnp.ndarray):
 
 def infer_single_diffrax(
     ctx_tokens: jnp.ndarray,
-    xi_emb: jnp.ndarray,
-    eta: jnp.ndarray,
+    xi_attn_emb: jnp.ndarray,
+    xi_hopf: jnp.ndarray,
     a: jnp.ndarray,
+    b: jnp.ndarray,
     c: jnp.ndarray,
-    W_out: jnp.ndarray,
+    w_out: jnp.ndarray,
     b_out: jnp.ndarray,
-    b_att_template: Optional[jnp.ndarray],
 ):
     """
     Run inference for one context using Tsit5 + adaptive steps.
     This is reusable and used both for debugging and batched eval.
     """
-    Xi = xi_emb[ctx_tokens]  # (L_ctx, D)
-    L_ctx, D = Xi.shape
-
-    if b_att_template is None:
-        b_att = jnp.zeros((L_ctx,), dtype=jnp.float32)
-    else:
-        b_att = b_att_template[:L_ctx]
+    xi_attn = xi_attn_emb[ctx_tokens]  # (L, D)
+    L, D = xi_attn.shape
 
     P = DynParams(
-        Xi=Xi,
-        eta=eta,
+        xi_attn=xi_attn,
+        xi_hopf=xi_hopf,
         a=a,
-        b_att=b_att,
+        b=b,
         c=c,
-        beta=jnp.asarray(BETA, dtype=jnp.float32),
-        tau_v=jnp.asarray(TAU_V, dtype=jnp.float32),
-        tau_h=jnp.asarray(TAU_H, dtype=jnp.float32),
+        beta=BETA,
+        tau_v=TAU_V,
+        tau_h=TAU_H,
     )
 
-    x0 = build_initial_state(D, Xi, b_att, eta, c)
+    x_0 = build_initial_state(D, xi_attn, xi_hopf, b, c)
 
-    sol = integrate_dynamics(
-        P,
-        x0,
-        t1=T_FINAL,
-        saveat=diffrax.SaveAt(t1=True),
-    )
+    sol = integrate_dynamics(P, x_0, t1=T_FINAL, saveat=diffrax.SaveAt(t1=True))
 
     # With SaveAt(t1=True), sol.ys has shape (1, state_dim)
+    assert sol.ys is not None, "sol.ys is None"
     x_T = sol.ys.reshape(-1)  # (state_dim,)
-    v_T = x_T[:D]             # (D,)
+    v_T = x_T[:D]  # (D,)
 
-    logits, _, pred = decode_final(v_T, W_out, b_out)
+    logits, _, pred = decode_final(v_T, w_out, b_out)
     return pred, logits, v_T
 
 
@@ -220,76 +209,64 @@ def run_model_direct_inference(ctx_tokens: jnp.ndarray, params: dict):
     """
     Run inference using model_direct's forward-Euler unroll on the given context.
     """
-    L = int(md.Cfg.L)
-    D = int(md.Cfg.D)
+    L = int(Config.L)
+    D = int(Config.D)
     if ctx_tokens.ndim != 1 or ctx_tokens.shape[0] != L:
         raise ValueError(f"ctx_tokens must have shape ({L},), got {ctx_tokens.shape}")
 
     ctx_bits = jnp.asarray(ctx_tokens, dtype=jnp.int32).reshape(1, L)
-    V0 = jnp.zeros((1, D), dtype=jnp.float32)
+    v_0 = jnp.zeros((1, D), dtype=jnp.float32)
 
-    V_T_batched, _ = md.infer_forward_euler(params, V0, ctx_bits)  # (1, D)
-    logits_batched = md.logits_from_v(params, V_T_batched)         # (1, C)
+    V_T_batched, _ = infer_forward_euler(params, v_0, ctx_bits)  # (1, D)
+    logits_batched = logits_from_v(params, V_T_batched)  # (1, C)
 
     logits = logits_batched[0]
     pred = int(jnp.argmax(logits))
-    V_T = V_T_batched[0]
-    return logits, pred, V_T
+    v_T = V_T_batched[0]
+    return logits, pred, v_T
 
 
-def evaluate_model(n_samples: int = 256, seed: int = 0):
+def evaluate_model():
     """
     Evaluate the dynamics model by sampling random bit strings and
     checking classification accuracy against parity labels.
     """
-    # ------------------------------------------
-    # Load trained parameters
-    # ------------------------------------------
-    with open(PICKLE_PATH, "rb") as f:
-        p = pickle.load(f)
-
-    xi_emb_raw = jnp.asarray(p["xi_emb"], dtype=jnp.float32)
-    xi_emb = jnp.square(xi_emb_raw)
-
-    eta_raw = jnp.asarray(p["eta"], dtype=jnp.float32)
-    eta = jnp.square(eta_raw)
-
-    a = jnp.asarray(p["a_v"], dtype=jnp.float32)
-    c = jnp.asarray(p["c"], dtype=jnp.float32)
-    W_out = jnp.asarray(p["W_out"], dtype=jnp.float32)
-    b_out = jnp.asarray(p["b_out"], dtype=jnp.float32)
-
-    raw_b_att = p.get("b_att", 0.0)
-    if isinstance(raw_b_att, float):
-        b_att_template = None
-    else:
-        b_att_template = jnp.asarray(raw_b_att, dtype=jnp.float32)
-
-    # ------------------------------------------
     # Debug: single context trajectory
-    # ------------------------------------------
     debug_ctx = jnp.array([0, 1, 0, 1, 1, 0, 1, 0], dtype=jnp.int32)
 
-    Xi_dbg = xi_emb[debug_ctx]
-    L_dbg, D_dbg = Xi_dbg.shape
+    P = load_params("data/model.npz")
 
-    if b_att_template is None:
+    xi_attn_emb_raw = P["xi_attn_emb"]
+    xi_attn_emb = jnp.square(xi_attn_emb_raw)
+    xi_attn = xi_attn_emb[debug_ctx]
+    L_dbg, D_dbg = xi_attn.shape
+
+    xi_hopf_raw = P["xi_hopf"]
+    xi_hopf = jnp.square(xi_hopf_raw)
+
+    a = P["a"]
+    c = P["c"]
+    w_dec = P["w_dec"]
+    b_dec = P["b_dec"]
+
+    b = P.get("b", 0.0)
+    if isinstance(b, float):
         b_att_dbg = jnp.zeros((L_dbg,), dtype=jnp.float32)
     else:
-        b_att_dbg = b_att_template[:L_dbg]
+        b_att_dbg = b[:L_dbg]
 
     P_dbg = DynParams(
-        Xi=Xi_dbg,
-        eta=eta,
+        xi_attn=xi_attn,
+        xi_hopf=xi_hopf,
         a=a,
-        b_att=b_att_dbg,
+        b=b_att_dbg,
         c=c,
         beta=BETA,
         tau_v=TAU_V,
         tau_h=TAU_H,
     )
 
-    x0_dbg = build_initial_state(D_dbg, Xi_dbg, b_att_dbg, eta, c)
+    x0_dbg = build_initial_state(D_dbg, xi_attn, xi_hopf, b_att_dbg, c)
 
     # reference grid for inspection
     n_ref = max(1, int(T_FINAL / ALPHA))
@@ -301,20 +278,26 @@ def evaluate_model(n_samples: int = 256, seed: int = 0):
         t1=T_FINAL,
         saveat=diffrax.SaveAt(ts=ts),
     )
+    assert sol_dbg.ys is not None, "sol_dbg.ys is None"
     ys_dbg = sol_dbg.ys  # (n_ref+1, state_dim)
     v_T_dbg = ys_dbg[-1, :D_dbg]
-    logits_dbg, prob_dbg, pred_dbg = decode_final(v_T_dbg, W_out, b_out)
+    logits_dbg, prob_dbg, pred_dbg = decode_final(v_T_dbg, w_dec, b_dec)
 
     # Compare with forward-Euler training dynamics on the same debug context
-    md_logits, md_pred, md_vT = run_model_direct_inference(debug_ctx, {
-        "xi_emb": xi_emb_raw,
-        "eta": eta_raw,
-        "a_v": a,
-        "c": c,
-        "W_out": W_out,
-        "b_out": b_out,
-        "b_att": jnp.asarray(raw_b_att) if "b_att" in p else jnp.zeros((md.Cfg.L,))
-    })
+    md_logits, md_pred, md_vT = run_model_direct_inference(
+        debug_ctx,
+        {
+            "xi_attn_emb": xi_attn_emb_raw,
+            "xi_hopf": xi_hopf_raw,
+            "a": a,
+            "c": c,
+            "w_dec": w_dec,
+            "b_dec": b_dec,
+            "b": (
+                jnp.asarray(b) if "b" in P else jnp.zeros((Config.L,))
+            ),
+        },
+    )
 
     print("=== debug: diffrax dynamics ===")
     print("final_logits:", jnp.asarray(logits_dbg))
@@ -327,25 +310,26 @@ def evaluate_model(n_samples: int = 256, seed: int = 0):
     print("md_pred:", md_pred)
     print("||v_T - md_vT||:", float(jnp.linalg.norm(v_T_dbg - md_vT)))
 
-    # ------------------------------------------
-    # Load dataset
-    # ------------------------------------------
-    from model_energy_train import load_dataset
     _, _, test_X, test_y = load_dataset(filename_prefix="parity_data")
 
     # Forward-Euler logits (reference)
-    logits_euler = jnp.array([
-        run_model_direct_inference(ctx_i, {
-            "xi_emb": xi_emb_raw,
-            "eta": eta_raw,
-            "a_v": a,
-            "c": c,
-            "W_out": W_out,
-            "b_out": b_out,
-            "b_att": jnp.asarray(raw_b_att) if "b_att" in p else jnp.zeros((md.Cfg.L,))
-        })[0]
-        for ctx_i in tqdm(test_X)
-    ])
+    logits_euler = jnp.array(
+        [
+            run_model_direct_inference(
+                ctx_i,
+                {
+                    "xi_attn_emb": xi_attn_emb_raw,
+                    "xi_hopf": xi_hopf_raw,
+                    "a": a,
+                    "b": b,
+                    "c": c,
+                    "w_dec": w_dec,
+                    "b_dec": b_dec,
+                },
+            )[0]
+            for ctx_i in tqdm(test_X)
+        ]
+    )
 
     # ------------------------------------------
     # Diffrax-based inference on test set
@@ -356,13 +340,13 @@ def evaluate_model(n_samples: int = 256, seed: int = 0):
     def vmapped_infer(ctx_tokens):
         pred, logits, _ = infer_single_diffrax(
             ctx_tokens,
-            xi_emb,
-            eta,
+            xi_attn_emb,
+            xi_hopf,
             a,
+            b,
             c,
-            W_out,
-            b_out,
-            b_att_template,
+            w_dec,
+            b_dec,
         )
         return pred, logits
 
@@ -379,7 +363,7 @@ def evaluate_model(n_samples: int = 256, seed: int = 0):
 
 
 def main():
-    evaluate_model(n_samples=1000, seed=0)
+    evaluate_model()
 
 
 if __name__ == "__main__":
