@@ -1,4 +1,5 @@
 import os
+from typing import List
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import time
@@ -73,9 +74,9 @@ if __name__ == "__main__":
         return params, opt_state, loss
 
     losses_all = []
-    losses_steps = []
+    losses_steps: List[int] = []
     accs_all = []
-    accs_steps = []
+    accs_steps: List[int] = []
     for epoch in range(Config.train_epochs):
         t_start = time.time()
         key, key_perm = jr.split(key)

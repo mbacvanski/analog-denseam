@@ -17,7 +17,7 @@ def load_params(fname: str) -> ModelParams:
     return {k: jnp.array(loaded[k]) for k in loaded.files}
 
 
-def save_metrics(obj: Dict[str, List[int | float]], fname: str):
+def save_metrics(obj: Dict[str, List[int] | List[float]], fname: str):
     with open(fname, "w") as f:
         json.dump(obj, f)
 
