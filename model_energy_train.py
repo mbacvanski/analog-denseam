@@ -1,4 +1,5 @@
 import os
+from typing import List
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import time
@@ -41,7 +42,7 @@ if __name__ == "__main__":
             end_value=peak * end_factor,
         )
 
-    # don't apply weight decay to W_enc and W_hopf
+    # don't apply weight decay to xi_attn_embed_raw and xi_hopf_raw
     tx_fast = optax.chain(
         optax.clip_by_global_norm(Config.max_norm),
         optax.adamw(
@@ -73,9 +74,9 @@ if __name__ == "__main__":
         return params, opt_state, loss
 
     losses_all = []
-    losses_steps = []
+    losses_steps: List[int] = []
     accs_all = []
-    accs_steps = []
+    accs_steps: List[int] = []
     for epoch in range(Config.train_epochs):
         t_start = time.time()
         key, key_perm = jr.split(key)
