@@ -4,8 +4,8 @@ class Config:
     M: int = 16
     beta: float = 0.1
 
-    W_enc_scale: float = 0.1
-    W_hopf_scale: float = 0.06
+    xi_attn_embed_raw_scale: float = 0.1
+    xi_hopf_raw_scale: float = 0.06
 
     # --- Stable integration parameters ---
     step_size: float = 1e-3
