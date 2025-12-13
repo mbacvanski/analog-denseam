@@ -25,6 +25,7 @@ if __name__ == "__main__":
     train_X, train_y, valid_X, valid_y = load_dataset(filename_prefix="parity_data")
 
     params = init_params(key)
+    save_params(params, "data/init_params.npz")
 
     num_train = train_X.shape[0]
     num_batches = (num_train + Config.batch_size - 1) // Config.batch_size
