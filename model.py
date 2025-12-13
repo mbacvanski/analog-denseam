@@ -160,82 +160,192 @@ def _init_hidden(
     return H_attn0, H_hopf0, batch_xi_attn
 
 
-@functools.partial(jax.jit, donate_argnums=(1,))  # donate V0 buffer
-def infer_forward_euler_with_force(
-    params: ModelParams, V0: jax.Array, ctx_bits: jax.Array
+# @functools.partial(jax.jit, donate_argnums=(1,))  # donate V0 buffer
+# def infer_forward_euler_with_force(
+#     params: ModelParams, V0: jax.Array, ctx_bits: jax.Array
+# ) -> Tuple[jax.Array, jax.Array]:
+#     """
+#     Returns:
+#       V_T: (B, D) terminal visible state
+#       F_T: (B, D) force at V_T, i.e. dV/dt = -(1/tau_v) * dE/dV at V_T
+#     """
+#     step_v = Config.step_size / Config.tau_v
+#     step_h = Config.step_size / Config.tau_h
+
+#     H_attn0, H_hopf0, _ = _init_hidden(params, V0, ctx_bits)
+
+#     # Energy for batch with Xi captured (no per-step allocations beyond carry)
+#     def batch_energy(
+#         params: ModelParams,
+#         V: jax.Array,
+#         H_attn: jax.Array,
+#         H_hopf: jax.Array,
+#         F_attn: jax.Array,
+#         F_hopf: jax.Array,
+#     ) -> jax.Array:
+#         def _sample_energy(
+#             v: jax.Array,
+#             h_attn: jax.Array,
+#             h_hopf: jax.Array,
+#             f_attn: jax.Array,
+#             f_hopf: jax.Array,
+#             xi_attn: jax.Array,
+#         ) -> jax.Array:
+#             return energy_function(
+#                 xi_attn,
+#                 get_xi_hopf(params),
+#                 params["a"],
+#                 params["b"],
+#                 params["c"],
+#                 v,
+#                 h_attn,
+#                 h_hopf,
+#                 f_attn,
+#                 f_hopf,
+#             )
+
+#         xi_attn_embed = get_xi_attn_embed(params)  # (vocab_size, D)
+#         batch_xi_attn = xi_attn_embed[ctx_bits]
+#         Eb = jax.vmap(_sample_energy, in_axes=(0, 0, 0, 0, 0, 0))(
+#             V, H_attn, H_hopf, F_attn, F_hopf, batch_xi_attn
+#         )
+#         return jnp.sum(Eb)
+
+#     grad_E = jax.grad(batch_energy, argnums=(1, 4, 5))  # grads wrt (V, F_attn, F_hopf)
+
+#     def grads_activation(
+#         V: jax.Array, H_attn: jax.Array, H_hopf: jax.Array
+#     ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+#         F_attn = jax.nn.softmax(Config.beta * H_attn, axis=-1)
+#         F_hopf = jnp.maximum(H_hopf, 0.0)
+#         dE_dV, dE_dF_attn, dE_dF_hopf = grad_E(
+#             params, V, H_attn, H_hopf, F_attn, F_hopf
+#         )
+#         return dE_dV, dE_dF_attn, dE_dF_hopf
+
+#     def body(_, carry):
+#         V, H_attn, H_hopf = carry
+#         dE_dV, dE_dF_attn, dE_dF_hopf = grads_activation(V, H_attn, H_hopf)
+#         V = V - step_v * dE_dV
+#         H_attn = H_attn - step_h * dE_dF_attn
+#         H_hopf = H_hopf - step_h * dE_dF_hopf
+#         return (V, H_attn, H_hopf)
+
+#     V_T, H_attn_T, H_hopf_T = jax.lax.fori_loop(
+#         0, Config.n_steps, body, (V0, H_attn0, H_hopf0)
+#     )
+
+#     # Force at terminal state (no extra allocations beyond one grad eval)
+#     dE_dV_T, _, _ = grads_activation(V_T, H_attn_T, H_hopf_T)
+#     F_T = -(1.0 / Config.tau_v) * dE_dV_T
+#     return V_T, F_T
+
+
+def energy_single_explicit(
+    params,
+    xi_attn,
+    xi_hopf,
+    v,
+    h_attn,
+    h_hopf,
+    f_attn,
+    f_hopf,
+):
+    return energy_function(
+        xi_attn,
+        xi_hopf,
+        params["a"],
+        params["b"],
+        params["c"],
+        v,
+        h_attn,
+        h_hopf,
+        f_attn,
+        f_hopf,
+    )
+
+
+def infer_single_forward_euler_with_force(
+    params: ModelParams,
+    v0: jax.Array,  # (D,)
+    ctx_row: jax.Array,  # (L,)
 ) -> Tuple[jax.Array, jax.Array]:
-    """
-    Returns:
-      V_T: (B, D) terminal visible state
-      F_T: (B, D) force at V_T, i.e. dV/dt = -(1/tau_v) * dE/dV at V_T
-    """
+
     step_v = Config.step_size / Config.tau_v
     step_h = Config.step_size / Config.tau_h
 
-    H_attn0, H_hopf0, batch_xi_attn = _init_hidden(params, V0, ctx_bits)
+    xi_attn_embed = get_xi_attn_embed(params)
+    xi_hopf = get_xi_hopf(params)
 
-    # Energy for batch with Xi captured (no per-step allocations beyond carry)
-    def batch_energy(
-        params: ModelParams,
-        V: jax.Array,
-        H_attn: jax.Array,
-        H_hopf: jax.Array,
-        F_attn: jax.Array,
-        F_hopf: jax.Array,
-    ) -> jax.Array:
-        def _sample_energy(
-            v: jax.Array,
-            h_attn: jax.Array,
-            h_hopf: jax.Array,
-            f_attn: jax.Array,
-            f_hopf: jax.Array,
-            xi_attn: jax.Array,
-        ) -> jax.Array:
-            return energy_function(
-                xi_attn,
-                get_xi_hopf(params),
-                params["a"],
-                params["b"],
-                params["c"],
-                v,
-                h_attn,
-                h_hopf,
-                f_attn,
-                f_hopf,
-            )
+    xi_attn = xi_attn_embed[ctx_row]
 
-        Eb = jax.vmap(_sample_energy, in_axes=(0, 0, 0, 0, 0, 0))(
-            V, H_attn, H_hopf, F_attn, F_hopf, batch_xi_attn
-        )
-        return jnp.sum(Eb)
+    h_attn = xi_attn @ v0 + params["b"]
+    h_hopf = xi_hopf @ v0 + params["c"]
 
-    grad_E = jax.grad(batch_energy, argnums=(1, 4, 5))  # grads wrt (V, F_attn, F_hopf)
-
-    def grads_activation(
-        V: jax.Array, H_attn: jax.Array, H_hopf: jax.Array
-    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
-        F_attn = jax.nn.softmax(Config.beta * H_attn, axis=-1)
-        F_hopf = jnp.maximum(H_hopf, 0.0)
-        dE_dV, dE_dF_attn, dE_dF_hopf = grad_E(
-            params, V, H_attn, H_hopf, F_attn, F_hopf
-        )
-        return dE_dV, dE_dF_attn, dE_dF_hopf
-
-    def body(_, carry):
-        V, H_attn, H_hopf = carry
-        dE_dV, dE_dF_attn, dE_dF_hopf = grads_activation(V, H_attn, H_hopf)
-        V = V - step_v * dE_dV
-        H_attn = H_attn - step_h * dE_dF_attn
-        H_hopf = H_hopf - step_h * dE_dF_hopf
-        return (V, H_attn, H_hopf)
-
-    V_T, H_attn_T, H_hopf_T = jax.lax.fori_loop(
-        0, Config.n_steps, body, (V0, H_attn0, H_hopf0)
+    grad_E = jax.grad(
+        energy_single_explicit,
+        argnums=(3, 6, 7),  # v, f_attn, f_hopf
     )
 
-    # Force at terminal state (no extra allocations beyond one grad eval)
-    dE_dV_T, _, _ = grads_activation(V_T, H_attn_T, H_hopf_T)
-    F_T = -(1.0 / Config.tau_v) * dE_dV_T
+    def body(_, carry):
+        v, h_attn, h_hopf = carry
+
+        f_attn = jax.nn.softmax(Config.beta * h_attn)
+        f_hopf = jnp.maximum(h_hopf, 0.0)
+
+        dE_dv, dE_dF_attn, dE_dF_hopf = grad_E(
+            params,
+            xi_attn,
+            xi_hopf,
+            v,
+            h_attn,
+            h_hopf,
+            f_attn,
+            f_hopf,
+        )
+
+        v = v - step_v * dE_dv
+        h_attn = h_attn - step_h * dE_dF_attn
+        h_hopf = h_hopf - step_h * dE_dF_hopf
+
+        return (v, h_attn, h_hopf)
+
+    v_T, h_attn_T, h_hopf_T = jax.lax.fori_loop(
+        0, Config.n_steps, body, (v0, h_attn, h_hopf)
+    )
+
+    f_attn_T = jax.nn.softmax(Config.beta * h_attn_T)
+    f_hopf_T = jnp.maximum(h_hopf_T, 0.0)
+
+    dE_dv_T, _, _ = grad_E(
+        params,
+        xi_attn,
+        xi_hopf,
+        v_T,
+        h_attn_T,
+        h_hopf_T,
+        f_attn_T,
+        f_hopf_T,
+    )
+
+    f_T = -(1.0 / Config.tau_v) * dE_dv_T
+
+    return v_T, f_T
+
+
+@functools.partial(jax.jit, donate_argnums=(1,))
+def infer_forward_euler_with_force(
+    params: ModelParams, V0: jax.Array, ctx_bits: jax.Array  # (B, D)  # (B, L)
+) -> Tuple[jax.Array, jax.Array]:
+    """
+    Batched forward Euler inference.
+    """
+
+    V_T, F_T = jax.vmap(
+        infer_single_forward_euler_with_force,
+        in_axes=(None, 0, 0),
+    )(params, V0, ctx_bits)
+
     return V_T, F_T
 
 
@@ -424,7 +534,8 @@ def force_penalty_weight(epoch: int) -> float:
     t = (epoch - start) / duration
 
     # cosine ramp: 0 → 1
-    return Config.force_penalty_scale * (1.0 - math.cos(math.pi * t))
+    # return Config.force_penalty_scale * (1.0 - math.cos(math.pi * t))
+    return 0.0
 
 
 # Parameter partition
