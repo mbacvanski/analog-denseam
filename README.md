@@ -13,8 +13,7 @@ source .venv/bin/activate
 
 These notebooks use the pretrained weights stored in `data/model_best.npz`.
 
-Sample energy and visible neuron trajectories: `make_plots.ipynb`
-Training loss/accuracy: `plot_training.ipynb`
+`make_plots.ipynb` contains various plots, including sample energy and visible neuron trajectories and training/validation loss/accuracy.
 
 ## Train model
 
