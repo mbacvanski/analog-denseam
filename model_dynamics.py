@@ -309,9 +309,7 @@ def evaluate_model():
             "c": c,
             "W_dec": W_dec,
             "b_dec": b_dec,
-            "b": (
-                jnp.asarray(b) if "b" in p else jnp.zeros((Config.L,))
-            ),
+            "b": (jnp.asarray(b) if "b" in p else jnp.zeros((Config.L,))),
         },
     )
 
@@ -340,11 +338,7 @@ def evaluate_model():
                     "c": c,
                     "W_dec": W_dec,
                     "b_dec": b_dec,
-                    "b": (
-                        jnp.asarray(b)
-                        if "b" in p
-                        else jnp.zeros((Config.L,))
-                    ),
+                    "b": (jnp.asarray(b) if "b" in p else jnp.zeros((Config.L,))),
                 },
             )[0]
             for ctx_i in tqdm(test_X)

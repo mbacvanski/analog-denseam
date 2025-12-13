@@ -1,0 +1,27 @@
+[project]
+name = "analog-denseam"
+version = "0.1.0"
+description = "Analogic DenseAM"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "diffrax==0.7.0",
+    "jax==0.5.0",
+    "jax-metal==0.1.1",
+    "jupyter==1.1.1",
+    "matplotlib==3.10.1",
+    "optax==0.2.4",
+    "tqdm==4.67.1",
+]
+
+[dependency-groups]
+dev = [
+    "black>=25.9.0",
+    "flake8>=7.3.0",
+    "mypy>=1.18.2",
+    "pytest>=8.4.2",
+]
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = ["E203", "F722"]
