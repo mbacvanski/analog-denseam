@@ -128,4 +128,4 @@ if __name__ == "__main__":
     save_metrics({"step": accs_steps, "accuracy": accs_all}, "data/accs.json")
 
     save_params(params, "data/model.npz")
-    print("Training complete. Model parameters saved to 'model.pkl'.")
+    print("Training complete. Model parameters saved to 'data/model.npz'.")

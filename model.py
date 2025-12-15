@@ -1,6 +1,6 @@
 import functools
 import math
-from typing import Tuple
+from typing import Dict, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -66,10 +66,15 @@ def L_hopf(h: jax.Array) -> jax.Array:  # (B,M) -> (B,)
     return 0.5 * jnp.sum(r * r, axis=-1)
 
 
-# ------------------------------------------------------------
-# Mixed-coordinate energy
-# ------------------------------------------------------------
-def energy_per_sample(params, v, h_attn, h_hopf, p, a, ctx_bits_row):
+def energy_per_sample(
+    params: ModelParams,
+    v: jax.Array,
+    h_attn: jax.Array,
+    h_hopf: jax.Array,
+    f_attn: jax.Array,
+    f_hopf: jax.Array,
+    ctx_bits_row: jax.Array,
+) -> jax.Array:
     # Xi: (L, D) rows selected by the tokens in this sequence (positive-used)
     xi_attn_embed = get_xi_attn_embed(params)  # (vocab_size, D)
     xi_attn = xi_attn_embed[ctx_bits_row]  # (L, D)
@@ -79,17 +84,25 @@ def energy_per_sample(params, v, h_attn, h_hopf, p, a, ctx_bits_row):
     vis_term = 0.5 * jnp.dot(dv, dv)  # scalar
 
     # Couplings (positive-used eta)
-    coupling = jnp.dot(v, xi_attn.T @ p + get_xi_hopf(params).T @ a)  # scalar
+    coupling = jnp.dot(v, xi_attn.T @ f_attn + get_xi_hopf(params).T @ f_hopf)  # scalar
 
     # Linear Fenchel-Young-style saddle terms (activation coords)
-    attn_bias = jnp.dot(p, h_attn - params["b"])  # scalar
-    hopf_bias = jnp.dot(a, h_hopf - params["c"])  # scalar
+    attn_bias = jnp.dot(f_attn, h_attn - params["b"])  # scalar
+    hopf_bias = jnp.dot(f_hopf, h_hopf - params["c"])  # scalar
 
     # Total mixed-coordinate energy
     return vis_term - coupling + attn_bias + hopf_bias - L_attn(h_attn) - L_hopf(h_hopf)
 
 
-def energy_per_batch(params, V, H_attn, H_hopf, F_attn, F_hopf, ctx_bits):
+def energy_per_batch(
+    params: ModelParams,
+    V: jax.Array,
+    H_attn: jax.Array,
+    H_hopf: jax.Array,
+    F_attn: jax.Array,
+    F_hopf: jax.Array,
+    ctx_bits: jax.Array,
+) -> jax.Array:
     """
     V:      (B, D)
     H_att:  (B, L)
@@ -104,10 +117,9 @@ def energy_per_batch(params, V, H_attn, H_hopf, F_attn, F_hopf, ctx_bits):
     return jnp.sum(E_b)
 
 
-# ------------------------------------------------------------
-# Inference: forward Euler on activation-gradient flow
-# ------------------------------------------------------------
-def _init_hidden(params, V0, ctx_bits):
+def _init_hidden(
+    params: ModelParams, V0: jax.Array, ctx_bits: jax.Array
+) -> Tuple[jax.Array, jax.Array]:
     """
     Initialize hidden states at their targets for V0.
     H_attn0 = Xi V0 + b
@@ -187,7 +199,9 @@ def infer_forward_euler_with_force(
 
 
 @jax.jit
-def infer_forward_euler(params, V0, ctx_bits):
+def infer_forward_euler(
+    params: ModelParams, V0: jax.Array, ctx_bits: jax.Array
+) -> Tuple[jax.Array, jax.Array]:
     """
     Returns:
       V_T: (B, D)
@@ -199,9 +213,9 @@ def infer_forward_euler(params, V0, ctx_bits):
     H_hopf0 = V0 @ get_xi_hopf(params).T + params["c"]
 
     # Pack everything needed for grads to avoid repeated closures
-    def energy_batch_w_Xi(params, V, H_attn, H_hopf, F_attn, F_hopf):
+    def energy_batch_w_xi(params, V, H_attn, H_hopf, F_attn, F_hopf):
         # same as energy_per_batch, but use Xi_seq captured from outer scope
-        def energy_per_sample_wXi(v, h_attn, h_hopf, f_attn, f_hopf, xi_attn):
+        def energy_per_sample_w_xi(v, h_attn, h_hopf, f_attn, f_hopf, xi_attn):
             dv = v - params["a"]
             vis = 0.5 * jnp.dot(dv, dv)
             coupling = jnp.dot(v, xi_attn.T @ f_attn + get_xi_hopf(params).T @ f_hopf)
@@ -211,13 +225,13 @@ def infer_forward_euler(params, V0, ctx_bits):
                 vis - coupling + att_bias + hopf_bias - L_attn(h_attn) - L_hopf(h_hopf)
             )
 
-        Eb = jax.vmap(energy_per_sample_wXi, in_axes=(0, 0, 0, 0, 0, 0))(
+        Eb = jax.vmap(energy_per_sample_w_xi, in_axes=(0, 0, 0, 0, 0, 0))(
             V, H_attn, H_hopf, F_attn, F_hopf, batch_xi_attn
         )
         return jnp.sum(Eb)
 
     grad_E = jax.grad(
-        energy_batch_w_Xi, argnums=(1, 4, 5)
+        energy_batch_w_xi, argnums=(1, 4, 5)
     )  # grads w.r.t. (V, F_attn, F_hopf)
 
     def grads_activation(V, H_attn, H_hopf):
@@ -244,10 +258,9 @@ def infer_forward_euler(params, V0, ctx_bits):
     return V_T, V_traj
 
 
-# ------------------------------------------------------------
-# Direct inference with full trajectories
-# ------------------------------------------------------------
-def run_model_inference_steps(ctx_bits, params, V0=None):
+def run_model_inference_steps(
+    ctx_bits: jax.Array, params: ModelParams, V0: jax.Array | None = None
+) -> Tuple[Tuple[jax.Array, jax.Array, jax.Array], Dict[str, jax.Array]]:
     """
     Run forward Euler inference and return trajectories of
     logits, visible V, hidden preactivations (H_att, H_hopf),
@@ -258,7 +271,8 @@ def run_model_inference_steps(ctx_bits, params, V0=None):
       V0 (optional): (B, D), defaults to zeros
     """
     B = ctx_bits.shape[0]
-    V0 = jnp.zeros((B, Config.D), dtype=jnp.float32)
+    if V0 is None:
+        V0 = jnp.zeros((B, Config.D), dtype=jnp.float32)
 
     H_attn0, H_hopf0 = _init_hidden(params, V0, ctx_bits)
 
@@ -316,9 +330,6 @@ def run_model_inference_steps(ctx_bits, params, V0=None):
     return (V_T, H_attn_T, H_hopf_T), traj
 
 
-# ------------------------------------------------------------
-# Readout and loss
-# ------------------------------------------------------------
 def logits_from_v(params: ModelParams, V: jax.Array) -> jax.Array:
     return V @ params["W_dec"].T + params["b_dec"]  # (B, vocab_size)
 
